@@ -51,13 +51,10 @@ extension AsrManager {
                 encoderOutputProvider = preprocessorOutput
             }
 
-            let rawEncoderOutput = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder", errorMessage: "Invalid encoder output")
-            let encoderLength = try extractFeatureValue(
-                from: encoderOutputProvider, key: "encoder_length",
-                errorMessage: "Invalid encoder output length")
-
-            let encoderSequenceLength = encoderLength[0].intValue
+            let (rawEncoderOutput, encoderSequenceLength) = try extractEncoderOutputs(
+                from: encoderOutputProvider,
+                encoderModel: encoderModel
+            )
 
             // Calculate actual audio frames if not provided using shared constants
             let actualFrames =
@@ -88,6 +85,52 @@ extension AsrManager {
             }
             throw error
         }
+    }
+
+    /// Resolves encoder tensor + sequence length from Core ML outputs.
+    /// Japanese `parakeet-0.6b-ja-coreml` exposes `encoder_output` (not always `encoder`).
+    internal func extractEncoderOutputs(
+        from provider: MLFeatureProvider,
+        encoderModel: MLModel?
+    ) throws -> (tensor: MLMultiArray, sequenceLength: Int) {
+        let declaredOutputs = encoderModel?.modelDescription.outputDescriptionsByName ?? [:]
+        let preferredTensorKeys = ["encoder", "encoder_output", "encoded", "output", "y"]
+        let tensorKey = preferredTensorKeys.first { key in
+            declaredOutputs[key]?.type == .multiArray
+                || provider.featureValue(for: key)?.multiArrayValue != nil
+        }
+        guard let tensorKey,
+            let rawEncoderOutput = provider.featureValue(for: tensorKey)?.multiArrayValue
+        else {
+            let available = provider.featureNames.sorted().joined(separator: ", ")
+            throw ASRError.processingFailed("Invalid encoder output (available: \(available))")
+        }
+
+        let preferredLengthKeys = ["encoder_length", "encoded_length", "length", "enc_length"]
+        if let lengthKey = preferredLengthKeys.first(where: {
+            provider.featureValue(for: $0)?.multiArrayValue != nil
+        }), let encoderLength = provider.featureValue(for: lengthKey)?.multiArrayValue {
+            return (rawEncoderOutput, encoderLength[0].intValue)
+        }
+
+        let shape = rawEncoderOutput.shape.map { $0.intValue }
+        guard shape.count == 3, shape[0] == 1 else {
+            throw ASRError.processingFailed("Invalid encoder output shape: \(shape)")
+        }
+        let hiddenSize = asrModels?.version.encoderHiddenSize ?? ASRConstants.encoderHiddenSize
+        let timeAxis: Int
+        if shape[1] == hiddenSize {
+            timeAxis = 2
+        } else if shape[2] == hiddenSize {
+            timeAxis = 1
+        } else {
+            throw ASRError.processingFailed("Encoder hidden size mismatch: \(shape), expected \(hiddenSize)")
+        }
+        let sequenceLength = shape[timeAxis]
+        guard sequenceLength > 0 else {
+            throw ASRError.processingFailed("Encoder output has no frames")
+        }
+        return (rawEncoderOutput, sequenceLength)
     }
 
     private func prepareEncoderInput(

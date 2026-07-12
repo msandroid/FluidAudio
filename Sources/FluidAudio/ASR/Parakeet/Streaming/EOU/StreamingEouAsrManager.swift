@@ -214,6 +214,9 @@ public actor StreamingEouAsrManager {
     /// Total samples processed (for timing)
     private var totalSamplesProcessed: Int = 0
 
+    /// Safety cap: force EOU when token buffer exceeds this count (prevents unbounded accumulation).
+    public var maxTokensBeforeForcedEou: Int
+
     public private(set) var configuration: MLModelConfiguration
     public let debugFeatures: Bool
     private var debugFeatureBuffer: [Float] = []
@@ -234,13 +237,17 @@ public actor StreamingEouAsrManager {
         configuration: MLModelConfiguration = MLModelConfiguration(),
         chunkSize: StreamingChunkSize = .ms160,
         eouDebounceMs: Int = 1280,
+        maxTokensBeforeForcedEou: Int = 250,
         debugFeatures: Bool = false
     ) {
         self.configuration = configuration
         self.chunkSize = chunkSize
         self.eouDebounceMs = eouDebounceMs
+        self.maxTokensBeforeForcedEou = maxTokensBeforeForcedEou
         self.debugFeatures = debugFeatures
-        logger.info("Initialized with chunk size: \(chunkSize.durationMs)ms, EOU debounce: \(eouDebounceMs)ms")
+        logger.info(
+            "Initialized with chunk size: \(chunkSize.durationMs)ms, EOU debounce: \(eouDebounceMs)ms, max forced EOU tokens: \(maxTokensBeforeForcedEou)"
+        )
     }
 
     /// Set a callback to be invoked when End-of-Utterance is detected.
@@ -628,6 +635,23 @@ public actor StreamingEouAsrManager {
         } else {
             // Model did not predict EOU - speech is ongoing, reset debounce timer
             eouFirstDetectedAt = nil
+            
+            // Safety guard: Force an EOU if the utterance grows excessively long.
+            // This prevents infinite string accumulation, UI lag, and translation pipeline stalls 
+            // if the user speaks continuously for a very long time without a 3-second pause.
+            let maxTokensBeforeForcedEou = self.maxTokensBeforeForcedEou
+            if accumulatedTokenIds.count > maxTokensBeforeForcedEou && !eouDetected {
+                eouDetected = true
+                logger.warning("Forced EOU at chunk \\(processedChunks) due to max token count (\\(maxTokensBeforeForcedEou)) exceeded")
+                let eouTimestampMs = (totalSamplesProcessed * 1000) / 16000
+                accumulatedEouTimestampsMs.append(eouTimestampMs)
+                
+                // Invoke callback with current transcript
+                if let callback = eouCallback, let tokenizer = tokenizer {
+                    let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+                    callback(transcript)
+                }
+            }
         }
 
         processedChunks += 1
@@ -665,6 +689,7 @@ extension StreamingEouAsrManager: StreamingAsrManager {
             if actualShift > 0 {
                 audioBuffer.removeFirst(actualShift)
             }
+            await Task.yield()
         }
     }
 

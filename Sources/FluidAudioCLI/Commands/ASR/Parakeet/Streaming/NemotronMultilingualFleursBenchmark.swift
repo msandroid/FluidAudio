@@ -787,16 +787,16 @@ extension NemotronMultilingualFleursBenchmark {
 
             // Print summary table
             print("")
-            print(
+            let summaryHeader =
                 "Language".padding(toLength: 12, withPad: " ", startingAt: 0) + " | "
-                    + "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
-                    + "WER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "CER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
-                    + "Duration".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Processed".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
-                    + "Skipped"
-            )
+                + "Prompt".padding(toLength: 8, withPad: " ", startingAt: 0) + " | "
+                + "WER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
+                + "CER%".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
+                + "RTFx".padding(toLength: 6, withPad: " ", startingAt: 0) + " | "
+                + "Duration".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
+                + "Processed".padding(toLength: 9, withPad: " ", startingAt: 0) + " | "
+                + "Skipped"
+            print(summaryHeader)
             print(String(repeating: "-", count: 80))
 
             for r in results {

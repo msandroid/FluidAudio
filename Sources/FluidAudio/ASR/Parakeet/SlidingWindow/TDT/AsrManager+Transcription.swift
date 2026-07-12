@@ -121,4 +121,18 @@ extension AsrManager {
         )
     }
 
+    /// Probes whether a cold-start assembled sliding-window of `windowSamples.count` samples decodes
+    /// without encoder zero-shape failures (fixed-15s parakeet-0.6b-ja path).
+    public func probeSlidingWindowAssembledWindow(
+        _ windowSamples: [Float],
+        decoderState: inout TdtDecoderState
+    ) async throws {
+        _ = try await transcribeChunk(
+            windowSamples,
+            decoderState: &decoderState,
+            previousTokens: [],
+            isLastChunk: false
+        )
+    }
+
 }

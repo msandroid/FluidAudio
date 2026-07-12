@@ -15,9 +15,8 @@ public enum Repo: String, CaseIterable, Sendable {
     /// Paraformer-large (zh) — non-autoregressive ASR: SANM encoder + CIF
     /// predictor (host-side integrate-and-fire) + parallel decoder. See ASR/Paraformer.
     case paraformerLargeZh = "FluidInference/paraformer-large-zh-coreml"
-    // Japanese hybrid TDT: INT8 CTC-trained preprocessor+encoder paired with a
-    // TDT decoder+joint. CTC-only inference for Japanese was removed in
-    // 846924a1d; only the preprocessor+encoder files from this repo are reused.
+    /// Japanese Parakeet repo: TDT hybrid (Decoderv2/Jointerv2) and CTC-only head
+    /// (`CtcDecoder.mlmodelc`) share Preprocessor + Encoder from this HF repo.
     case parakeetJa = "FluidInference/parakeet-0.6b-ja-coreml"
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
@@ -422,6 +421,26 @@ public enum ModelNames {
         ]
     }
 
+    /// CTC ja model names (full pipeline: Preprocessor + Encoder + CtcDecoder)
+    /// See https://huggingface.co/FluidInference/parakeet-0.6b-ja-coreml
+    public enum CTCJa {
+        public static let preprocessor = "Preprocessor"
+        public static let encoder = "Encoder"
+        public static let decoder = "CtcDecoder"
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+
+        public static let vocabularyFile = "vocab.json"
+
+        public static let requiredModels: Set<String> = [
+            preprocessorFile,
+            encoderFile,
+            decoderFile,
+        ]
+    }
+
     /// SenseVoiceSmall (FunASR) model names. 3-stage pipeline:
     ///   Preprocessor (fp32, CPU): waveform → 560-d LFR features
     ///   SenseVoiceSmall (fp16, ANE): features + lang/textnorm → CTC logits
@@ -482,10 +501,8 @@ public enum ModelNames {
     /// TDT ja (Japanese) model names.
     ///
     /// Hybrid layout: the CTC-trained preprocessor + encoder from the
-    /// `parakeetJa` repo are reused as the acoustic frontend, paired with a TDT
-    /// decoder + joint (filenames `Decoderv2.mlmodelc` / `Jointerv2.mlmodelc`
-    /// from the same repo). CTC-only inference for Japanese was removed in
-    /// 846924a1d.
+    /// TDT hybrid Japanese models (`Decoderv2` / `Jointerv2` from `parakeetJa` repo).
+    /// For CTC-only ja inference use `ModelNames.CTCJa` + `CtcJaManager`.
     public enum TDTJa {
         public static let preprocessor = "Preprocessor"
         public static let encoder = "Encoder"

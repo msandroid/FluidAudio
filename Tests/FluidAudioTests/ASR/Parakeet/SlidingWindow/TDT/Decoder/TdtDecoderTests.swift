@@ -117,7 +117,15 @@ final class TdtDecoderV3HelperTests: XCTestCase {
 
     // MARK: - Prepare Joint Input Tests
 
-    func testPrepareJointInput() throws {
+    func testPrepareJointInput() async throws {
+        let cacheDir = AsrModels.defaultCacheDirectory(for: .tdtJa)
+        guard AsrModels.modelsExist(at: cacheDir, version: .tdtJa) else {
+            throw XCTSkip("TDT ja models not on disk")
+        }
+        let models = try await AsrModels.load(from: cacheDir, version: .tdtJa)
+        guard let decoderModel = models.decoder else {
+            throw XCTSkip("TDT ja decoder model missing")
+        }
 
         // Create encoder output
         let encoderOutput = try MLMultiArray(
@@ -125,18 +133,20 @@ final class TdtDecoderV3HelperTests: XCTestCase {
             dataType: .float32
         )
 
-        // Create mock decoder output
+        // Create mock decoder output using the graph's projection key
+        let projectionKey = TdtModelInference.decoderProjectionOutputKey(for: decoderModel)
         let decoderOutputArray = try MLMultiArray(
             shape: [1, NSNumber(value: ASRConstants.decoderHiddenSize), 1],
             dataType: .float32
         )
         let decoderOutput = try MLDictionaryFeatureProvider(dictionary: [
-            "decoder": MLFeatureValue(multiArray: decoderOutputArray)
+            projectionKey: MLFeatureValue(multiArray: decoderOutputArray)
         ])
 
         let jointInput = try decoder.prepareJointInput(
             encoderOutput: encoderOutput,
             decoderOutput: decoderOutput,
+            decoderModel: decoderModel,
             timeIndex: 0
         )
 

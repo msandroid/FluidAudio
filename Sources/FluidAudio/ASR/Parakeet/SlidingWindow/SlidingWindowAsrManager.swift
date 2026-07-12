@@ -56,7 +56,15 @@ public actor SlidingWindowAsrManager {
     private var ctcSpotter: CtcKeywordSpotter?
     private var vocabularyRescorer: VocabularyRescorer?
     private var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
-    private var vocabBoostingEnabled: Bool { customVocabulary != nil && vocabularyRescorer != nil }
+    /// Parakeet CTC ja auxiliary path (same vocab as TDT ja, uses `CtcJaManager` log-probs).
+    private var ctcJaManager: CtcJaManager?
+    private var jaVocabularySpotter: CtcVocabularySpotter?
+    private var jaVocabularyBoostingEnabled: Bool {
+        customVocabulary != nil && ctcJaManager != nil && jaVocabularySpotter != nil
+    }
+    private var vocabBoostingEnabled: Bool {
+        (customVocabulary != nil && vocabularyRescorer != nil) || jaVocabularyBoostingEnabled
+    }
 
     /// Initialize the sliding-window ASR manager
     /// - Parameter config: Configuration for streaming behavior
@@ -113,6 +121,39 @@ public actor SlidingWindowAsrManager {
         logger.info(
             "Vocabulary boosting configured with \(vocabSize) terms (isLargeVocab: \(isLargeVocab))"
         )
+    }
+
+    /// Configure Japanese TDT vocabulary boosting using the shared `parakeet-ja` CTC decoder.
+    ///
+    /// Uses `CtcJaManager.transcribeWithLogProbs` on each confirmed sliding window, then applies
+    /// CTC keyword spotting + transcript biasing (same 3072-token SentencePiece vocab as TDT ja).
+    public func configureJaVocabularyBoosting(
+        vocabulary: CustomVocabularyContext,
+        ctcJaManager: CtcJaManager
+    ) async {
+        self.customVocabulary = vocabulary
+        self.ctcJaManager = ctcJaManager
+        self.ctcSpotter = nil
+        self.vocabularyRescorer = nil
+        self.vocabSizeConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: vocabulary.terms.count)
+        let blankId = await ctcJaManager.blankId
+        self.jaVocabularySpotter = CtcVocabularySpotter(blankId: blankId)
+        logger.info("JA vocabulary boosting configured with \(vocabulary.terms.count) terms")
+    }
+
+    /// Updates JA custom vocabulary terms without reloading Core ML models.
+    public func updateJaVocabularyBoosting(vocabulary: CustomVocabularyContext) {
+        guard ctcJaManager != nil, jaVocabularySpotter != nil else { return }
+        self.customVocabulary = vocabulary
+        self.vocabSizeConfig = ContextBiasingConstants.rescorerConfig(forVocabSize: vocabulary.terms.count)
+    }
+
+    /// Disables JA vocabulary boosting (TDT transcription continues unchanged).
+    public func clearJaVocabularyBoosting() {
+        customVocabulary = nil
+        ctcJaManager = nil
+        jaVocabularySpotter = nil
+        vocabSizeConfig = nil
     }
 
     /// Load ASR models (downloads if needed)
@@ -326,6 +367,7 @@ public actor SlidingWindowAsrManager {
         let left = config.leftContextSamples
         let sampleRate = config.asrConfig.sampleRate
 
+        let minWindow = config.minWindowSamplesForProcessing
         var currentAbsEnd = bufferStartIndex + sampleBuffer.count
         while currentAbsEnd >= (nextWindowCenterStart + chunk + right) {
             let leftStartAbs = max(0, nextWindowCenterStart - left)
@@ -334,6 +376,15 @@ public actor SlidingWindowAsrManager {
             let endIdx = rightEndAbs - bufferStartIndex
             if startIdx < 0 || endIdx > sampleBuffer.count || startIdx >= endIdx {
                 break
+            }
+
+            // Cold-start gate: fixed-length encoders break on short windows (zero shape).
+            // While left context is still clamped at the buffer head, the window is only
+            // `chunk + right`s. Advance the center without emitting until the window reaches
+            // the safe minimum; no audio is lost because the next window is a superset.
+            if minWindow > 0 && (rightEndAbs - leftStartAbs) < minWindow {
+                nextWindowCenterStart += chunk
+                continue
             }
 
             let window = Array(sampleBuffer[startIdx..<endIdx])
@@ -463,32 +514,43 @@ public actor SlidingWindowAsrManager {
 
             // Rescore before updating transcript state so finish() returns rescored content
             var displayResult = interim
-            if shouldConfirm && vocabBoostingEnabled,
-                let chunkLocalResult = await asrManager?.processTranscriptionResult(
+            if shouldConfirm && vocabBoostingEnabled {
+                if jaVocabularyBoostingEnabled {
+                    if let biasedText = await applyJaVocabularyBiasing(
+                        text: interim.text,
+                        windowSamples: windowSamples
+                    ) {
+                        displayResult = interim.withRescoring(
+                            text: biasedText,
+                            detected: nil,
+                            applied: nil
+                        )
+                    }
+                } else if let chunkLocalResult = await asrManager?.processTranscriptionResult(
                     tokenIds: tokens,
                     timestamps: timestamps,  // Original chunk-local timestamps (not adjusted)
                     confidences: confidences,
                     encoderSequenceLength: 0,
                     audioSamples: windowSamples,
                     processingTime: processingTime
-                )
-            {
-                let chunkLocalTimings = chunkLocalResult.tokenTimings ?? []
-
-                if let rescored = await applyVocabularyRescoring(
-                    text: interim.text,
-                    tokenTimings: chunkLocalTimings,
-                    windowSamples: windowSamples
                 ) {
-                    let detected = rescored.replacements.compactMap { $0.replacementWord }
-                    let applied = rescored.replacements.filter { $0.shouldReplace }.compactMap {
-                        $0.replacementWord
+                    let chunkLocalTimings = chunkLocalResult.tokenTimings ?? []
+
+                    if let rescored = await applyVocabularyRescoring(
+                        text: interim.text,
+                        tokenTimings: chunkLocalTimings,
+                        windowSamples: windowSamples
+                    ) {
+                        let detected = rescored.replacements.compactMap { $0.replacementWord }
+                        let applied = rescored.replacements.filter { $0.shouldReplace }.compactMap {
+                            $0.replacementWord
+                        }
+                        displayResult = interim.withRescoring(
+                            text: rescored.text,
+                            detected: detected.isEmpty ? nil : detected,
+                            applied: applied.isEmpty ? nil : applied
+                        )
                     }
-                    displayResult = interim.withRescoring(
-                        text: rescored.text,
-                        detected: detected.isEmpty ? nil : detected,
-                        applied: applied.isEmpty ? nil : applied
-                    )
                 }
             }
 
@@ -553,6 +615,48 @@ public actor SlidingWindowAsrManager {
     ///   - tokenTimings: Token-level timing information
     ///   - windowSamples: Audio samples for the current window
     /// - Returns: Rescored output if modifications were made, nil otherwise
+    private func applyJaVocabularyBiasing(
+        text: String,
+        windowSamples: [Float]
+    ) async -> String? {
+        guard let manager = ctcJaManager,
+            let vocab = customVocabulary,
+            let spotter = jaVocabularySpotter,
+            !vocab.terms.isEmpty,
+            !windowSamples.isEmpty
+        else {
+            return nil
+        }
+
+        do {
+            let ctcResult = try await manager.transcribeWithLogProbs(
+                audio: windowSamples,
+                audioLength: windowSamples.count
+            )
+            guard !ctcResult.logProbs.isEmpty else {
+                logger.debug("JA vocabulary biasing skipped: empty CTC log-probs")
+                return nil
+            }
+
+            let detections = spotter.spotKeywords(
+                logProbs: ctcResult.logProbs,
+                frameDuration: ctcResult.frameDuration,
+                customVocabulary: vocab
+            )
+            let biased = CtcTranscriptVocabularyBiasing.applyDetections(
+                to: text,
+                detections: detections
+            )
+            if biased != text {
+                logger.info("JA vocabulary biasing applied on confirmed chunk")
+            }
+            return biased != text ? biased : nil
+        } catch {
+            logger.debug("JA vocabulary biasing skipped: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     private func applyVocabularyRescoring(
         text: String,
         tokenTimings: [TokenTiming],
@@ -690,6 +794,19 @@ public struct SlidingWindowAsrConfig: Sendable {
     /// Confidence threshold for promoting volatile text to confirmed (0.0...1.0)
     public let confirmationThreshold: Double
 
+    /// Minimum assembled-window duration (seconds) before a window is sent to the encoder.
+    ///
+    /// Some Core ML encoders (e.g. `parakeet-0.6b-ja`) are exported as a fixed ~15s graph whose
+    /// internal `slice_by_index` collapses to a zero shape when the cold-start window (no left
+    /// context yet) is too short. With a large `leftContextSeconds` + small `chunkSeconds`
+    /// (low-latency cadence), the first few warm-up windows would otherwise be only
+    /// `chunk + right` seconds long. Gating on this minimum skips those unsafe short windows
+    /// without dropping audio (the next window is a superset), so steady-state windows stay near
+    /// the encoder's native length while updates arrive at the small `chunkSeconds` cadence.
+    ///
+    /// `0` disables the gate (legacy behavior).
+    public let minWindowSecondsForProcessing: TimeInterval
+
     /// TDT decoder configuration. When `nil`, `TdtConfig()` is used (blankId 8192, v3 default).
     /// Pass an explicit value when using a v2 model (blankId 1024) to avoid relying on
     /// `AsrManager`'s internal blank-token auto-adaptation.
@@ -717,6 +834,49 @@ public struct SlidingWindowAsrConfig: Sendable {
         confirmationThreshold: 0.80  // Higher threshold for more stable confirmations
     )
 
+    /// Voice-translation low-latency preset: smaller chunks and earlier confirmation.
+    /// `streaming` (11s / 10s context) yields ~11s between UI updates; this targets ~5s cadence
+    /// with first text around ~6s (chunk + right context + min confirmation context).
+    ///
+    /// WARNING: the ~8s assembled window breaks fixed-15s encoders such as `parakeet-0.6b-ja`
+    /// (`ios17.slice_by_index: zero shape`). Use `voiceLowLatencyNativeWindow` for those models.
+    public static let voiceLowLatency = SlidingWindowAsrConfig(
+        chunkSeconds: 5.0,
+        hypothesisChunkSeconds: 1.0,
+        leftContextSeconds: 2.0,
+        rightContextSeconds: 1.0,
+        minContextForConfirmation: 4.0,
+        confirmationThreshold: 0.78
+    )
+
+    /// Low-latency preset for fixed-length encoders (e.g. `parakeet-0.6b-ja`, native ~15s).
+    ///
+    /// Keeps the assembled window at the encoder's native length (`left + chunk + right = 15s`)
+    /// so the encoder graph never sees a short window, while advancing by a small `chunkSeconds`
+    /// for a ~4s update cadence (vs ~11s for `streaming`). `minWindowSecondsForProcessing` skips
+    /// the cold-start windows that would otherwise be shorter than the device-verified 13s floor.
+    public static let voiceLowLatencyNativeWindow = SlidingWindowAsrConfig(
+        chunkSeconds: 4.0,
+        hypothesisChunkSeconds: 1.0,
+        leftContextSeconds: 9.0,
+        rightContextSeconds: 2.0,
+        minContextForConfirmation: 6.0,
+        confirmationThreshold: 0.80,
+        minWindowSecondsForProcessing: 13.0
+    )
+
+    /// Aggressive fast-start variant of `voiceLowLatencyNativeWindow` (minWindow 10s).
+    /// Use only after a device warm-up probe confirms short cold-start windows are safe.
+    public static let voiceLowLatencyNativeWindowFastStart = SlidingWindowAsrConfig(
+        chunkSeconds: 4.0,
+        hypothesisChunkSeconds: 1.0,
+        leftContextSeconds: 9.0,
+        rightContextSeconds: 2.0,
+        minContextForConfirmation: 6.0,
+        confirmationThreshold: 0.80,
+        minWindowSecondsForProcessing: 10.0
+    )
+
     public init(
         chunkSeconds: TimeInterval = 10.0,
         hypothesisChunkSeconds: TimeInterval = 1.0,
@@ -724,6 +884,7 @@ public struct SlidingWindowAsrConfig: Sendable {
         rightContextSeconds: TimeInterval = 2.0,
         minContextForConfirmation: TimeInterval = 10.0,
         confirmationThreshold: Double = 0.85,
+        minWindowSecondsForProcessing: TimeInterval = 0.0,
         tdtConfig: TdtConfig? = nil
     ) {
         self.chunkSeconds = chunkSeconds
@@ -732,6 +893,7 @@ public struct SlidingWindowAsrConfig: Sendable {
         self.rightContextSeconds = rightContextSeconds
         self.minContextForConfirmation = minContextForConfirmation
         self.confirmationThreshold = confirmationThreshold
+        self.minWindowSecondsForProcessing = minWindowSecondsForProcessing
         self.tdtConfig = tdtConfig
     }
 
@@ -744,8 +906,44 @@ public struct SlidingWindowAsrConfig: Sendable {
             rightContextSeconds: rightContextSeconds,
             minContextForConfirmation: minContextForConfirmation,
             confirmationThreshold: confirmationThreshold,
+            minWindowSecondsForProcessing: minWindowSecondsForProcessing,
             tdtConfig: tdtConfig
         )
+    }
+
+    /// Returns a copy with an overridden cold-start minimum window (after device probe).
+    public func applying(
+        tdtConfig: TdtConfig,
+        minWindowSecondsForProcessing: TimeInterval
+    ) -> SlidingWindowAsrConfig {
+        SlidingWindowAsrConfig(
+            chunkSeconds: chunkSeconds,
+            hypothesisChunkSeconds: hypothesisChunkSeconds,
+            leftContextSeconds: leftContextSeconds,
+            rightContextSeconds: rightContextSeconds,
+            minContextForConfirmation: minContextForConfirmation,
+            confirmationThreshold: confirmationThreshold,
+            minWindowSecondsForProcessing: minWindowSecondsForProcessing,
+            tdtConfig: tdtConfig
+        )
+    }
+
+    /// Simulates cold-start window advancement; returns absolute audio seconds at first emit.
+    public static func firstEmitAudioSeconds(for config: SlidingWindowAsrConfig) -> TimeInterval {
+        let minWindow = config.minWindowSecondsForProcessing
+        if minWindow <= 0 {
+            return config.chunkSeconds + config.rightContextSeconds
+        }
+        var center: TimeInterval = 0
+        while true {
+            let leftStart = max(0, center - config.leftContextSeconds)
+            let rightEnd = center + config.chunkSeconds + config.rightContextSeconds
+            let windowLen = rightEnd - leftStart
+            if windowLen >= minWindow {
+                return rightEnd
+            }
+            center += config.chunkSeconds
+        }
     }
 
     /// Backward-compatible convenience initializer used by tests (chunkDuration label)
@@ -792,6 +990,7 @@ public struct SlidingWindowAsrConfig: Sendable {
     var leftContextSamples: Int { Int(leftContextSeconds * 16000) }
     var rightContextSamples: Int { Int(rightContextSeconds * 16000) }
     var minContextForConfirmationSamples: Int { Int(minContextForConfirmation * 16000) }
+    var minWindowSamplesForProcessing: Int { Int(minWindowSecondsForProcessing * 16000) }
 
     // Backward-compat convenience for existing call-sites/tests
     var chunkDuration: TimeInterval { chunkSeconds }

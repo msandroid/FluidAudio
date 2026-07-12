@@ -13,6 +13,36 @@ internal struct TdtModelInference: Sendable {
         self.predictionOptions = AsrModels.optimizedPredictionOptions()
     }
 
+    /// Resolves the decoder LSTM projection tensor name from the loaded Core ML graph.
+    /// Parakeet v3 uses `decoder`; ja Decoderv2 exports `dec_out` / `pred`.
+    static func decoderProjectionOutputKey(for model: MLModel) -> String {
+        let preferred = ["decoder", "dec_out", "pred", "output"]
+        let outputs = model.modelDescription.outputDescriptionsByName
+        for key in preferred where outputs[key]?.type == .multiArray {
+            return key
+        }
+        let excluded = Set(["h_out", "c_out", "h_in", "c_in", "targets", "target_length"])
+        if let key = outputs.first(where: { $0.value.type == .multiArray && !excluded.contains($0.key) })?.key {
+            return key
+        }
+        return "decoder"
+    }
+
+    /// Extract decoder projection from a decoder step output using graph-specific key resolution.
+    func extractDecoderProjection(
+        from output: MLFeatureProvider,
+        model: MLModel
+    ) throws -> MLMultiArray {
+        let key = Self.decoderProjectionOutputKey(for: model)
+        guard let value = output.featureValue(for: key)?.multiArrayValue else {
+            let available = output.featureNames.sorted().joined(separator: ", ")
+            throw ASRError.processingFailed(
+                "Invalid decoder output (key=\(key), available: \(available))"
+            )
+        }
+        return value
+    }
+
     /// Execute decoder LSTM with state caching.
     ///
     /// - Parameters:

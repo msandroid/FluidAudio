@@ -256,9 +256,13 @@ enum TranscribeCommand {
                         parsed.modelVersion = .v3
                     case "tdt-ctc-110m", "110m":
                         parsed.modelVersion = .tdtCtc110m
+                    case "tdt-ja", "tdtja", "ja":
+                        parsed.modelVersion = .tdtJa
+                    case "ctc-zh-cn", "zh-cn":
+                        parsed.modelVersion = .ctcZhCn
                     default:
                         fputs(
-                            "ERROR: Invalid model version: \(args[i + 1]). Use 'v2', 'v3', or 'tdt-ctc-110m'\n", stderr)
+                            "ERROR: Invalid model version: \(args[i + 1]). Use 'v2', 'v3', 'tdt-ctc-110m', or 'tdt-ja'\n", stderr)
                         fflush(stderr)
                         return nil
                     }

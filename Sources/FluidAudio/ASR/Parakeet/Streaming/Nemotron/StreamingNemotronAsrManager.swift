@@ -317,6 +317,7 @@ extension StreamingNemotronAsrManager: StreamingAsrManager {
             try await processChunk(chunk)
             let samplesToRemove = min(config.chunkSamples, audioBuffer.count)
             audioBuffer.removeFirst(samplesToRemove)
+            await Task.yield()
         }
     }
 

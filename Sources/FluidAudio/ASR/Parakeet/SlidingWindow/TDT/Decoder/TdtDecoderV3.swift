@@ -169,6 +169,7 @@ internal struct TdtDecoderV3: Sendable {
         let reusableTargetArray = try MLMultiArray(shape: [1, 1] as [NSNumber], dataType: .int32)
         let reusableTargetLengthArray = try MLMultiArray(shape: [1] as [NSNumber], dataType: .int32)
         reusableTargetLengthArray[0] = NSNumber(value: 1)
+        let decoderProjectionKey = TdtModelInference.decoderProjectionOutputKey(for: decoderModel)
 
         // Preallocate joint input tensors and a reusable provider to avoid per-step allocations.
         let encoderHidden = expectedEncoderHidden
@@ -211,8 +212,10 @@ internal struct TdtDecoderV3: Sendable {
                 targetArray: reusableTargetArray,
                 targetLengthArray: reusableTargetLengthArray
             )
-            let proj = try extractFeatureValue(
-                from: primed.output, key: "decoder", errorMessage: "Invalid decoder output")
+            let proj = try modelInference.extractDecoderProjection(
+                from: primed.output,
+                model: decoderModel
+            )
             decoderState.predictorOutput = proj
             hypothesis.decState = primed.newState
         }
@@ -240,7 +243,7 @@ internal struct TdtDecoderV3: Sendable {
             if let cached = decoderState.predictorOutput {
                 // Reuse cached decoder output - significant speedup
                 let provider = try MLDictionaryFeatureProvider(dictionary: [
-                    "decoder": MLFeatureValue(multiArray: cached)
+                    decoderProjectionKey: MLFeatureValue(multiArray: cached)
                 ])
                 decoderResult = (output: provider, newState: stateToUse)
             } else {
@@ -255,8 +258,10 @@ internal struct TdtDecoderV3: Sendable {
             }
 
             // Prepare decoder projection once and reuse for inner blank loop
-            let decoderProjection = try extractFeatureValue(
-                from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
+            let decoderProjection = try modelInference.extractDecoderProjection(
+                from: decoderResult.output,
+                model: decoderModel
+            )
             try modelInference.normalizeDecoderProjection(decoderProjection, into: reusableDecoderStep)
 
             // Run joint network with preallocated inputs
@@ -440,8 +445,10 @@ internal struct TdtDecoderV3: Sendable {
                     targetLengthArray: reusableTargetLengthArray
                 )
                 hypothesis.decState = step.newState
-                decoderState.predictorOutput = try extractFeatureValue(
-                    from: step.output, key: "decoder", errorMessage: "Invalid decoder output")
+                decoderState.predictorOutput = try modelInference.extractDecoderProjection(
+                    from: step.output,
+                    model: decoderModel
+                )
 
                 if timeIndicesCurrentLabels == lastEmissionTimestamp {
                     emissionsAtThisTimestamp += 1
@@ -486,7 +493,7 @@ internal struct TdtDecoderV3: Sendable {
                 let decoderResult: (output: MLFeatureProvider, newState: TdtDecoderState)
                 if let cached = decoderState.predictorOutput {
                     let provider = try MLDictionaryFeatureProvider(dictionary: [
-                        "decoder": MLFeatureValue(multiArray: cached)
+                        decoderProjectionKey: MLFeatureValue(multiArray: cached)
                     ])
                     decoderResult = (output: provider, newState: stateToUse)
                 } else {
@@ -508,8 +515,10 @@ internal struct TdtDecoderV3: Sendable {
                 ]
                 let frameIndex = frameVariations[additionalSteps % frameVariations.count]
                 // Prepare decoder projection into reusable buffer (if not already)
-                let finalProjection = try extractFeatureValue(
-                    from: decoderResult.output, key: "decoder", errorMessage: "Invalid decoder output")
+                let finalProjection = try modelInference.extractDecoderProjection(
+                    from: decoderResult.output,
+                    model: decoderModel
+                )
                 try modelInference.normalizeDecoderProjection(finalProjection, into: reusableDecoderStep)
 
                 let decision = try modelInference.runJointPrepared(
@@ -564,8 +573,10 @@ internal struct TdtDecoderV3: Sendable {
                         targetLengthArray: reusableTargetLengthArray
                     )
                     hypothesis.decState = step.newState
-                    decoderState.predictorOutput = try extractFeatureValue(
-                        from: step.output, key: "decoder", errorMessage: "Invalid decoder output")
+                    decoderState.predictorOutput = try modelInference.extractDecoderProjection(
+                        from: step.output,
+                        model: decoderModel
+                    )
                     lastToken = token
                 }
 
@@ -742,6 +753,7 @@ internal struct TdtDecoderV3: Sendable {
     internal func prepareJointInput(
         encoderOutput: MLMultiArray,
         decoderOutput: MLFeatureProvider,
+        decoderModel: MLModel,
         timeIndex: Int
     ) throws -> MLFeatureProvider {
         let encoderFrames = try EncoderFrameView(
@@ -755,8 +767,10 @@ internal struct TdtDecoderV3: Sendable {
         let destStrides = encoderStep.strides.map { $0.intValue }
         try encoderFrames.copyFrame(at: timeIndex, into: encoderPtr, destinationStride: destStrides[1])
 
-        let decoderProjection = try extractFeatureValue(
-            from: decoderOutput, key: "decoder", errorMessage: "Invalid decoder output")
+        let decoderProjection = try modelInference.extractDecoderProjection(
+            from: decoderOutput,
+            model: decoderModel
+        )
         let normalizedDecoder = try modelInference.normalizeDecoderProjection(decoderProjection)
 
         return try MLDictionaryFeatureProvider(dictionary: [

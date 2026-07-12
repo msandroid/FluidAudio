@@ -177,9 +177,23 @@ public actor AsrManager {
         // Pass the actual audio length, not the padded length
         let lengthArray = try createScalarArray(value: actualAudioLength)
 
+        let lengthFeatureKey: String
+        if let preprocessorModel {
+            let preInputs = Set(preprocessorModel.modelDescription.inputDescriptionsByName.keys)
+            if preInputs.contains("audio_length") {
+                lengthFeatureKey = "audio_length"
+            } else if preInputs.contains("length") {
+                lengthFeatureKey = "length"
+            } else {
+                lengthFeatureKey = "audio_length"
+            }
+        } else {
+            lengthFeatureKey = "audio_length"
+        }
+
         return try createFeatureProvider(features: [
             ("audio_signal", audioArray),
-            ("audio_length", lengthArray),
+            (lengthFeatureKey, lengthArray),
         ])
     }
 

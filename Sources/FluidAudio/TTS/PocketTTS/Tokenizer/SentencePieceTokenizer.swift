@@ -105,6 +105,20 @@ public struct SentencePieceTokenizer: Sendable {
         return ids
     }
 
+    /// Decode token IDs back to text (CTC / greedy decode post-processing).
+    ///
+    /// Joins vocabulary pieces and replaces SentencePiece space markers (`▁`) with spaces.
+    public func decode(_ ids: [Int]) -> String {
+        guard !ids.isEmpty else { return "" }
+        let text = ids.compactMap { id -> String? in
+            guard id >= 0, id < pieces.count else { return nil }
+            return pieces[id].piece
+        }.joined()
+        return text
+            .replacingOccurrences(of: String(Self.spaceMarker), with: " ")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
     /// Fallback: encode each character as a separate token.
     private func fallbackEncode(_ scalars: [Unicode.Scalar]) -> [Int] {
         var ids: [Int] = []

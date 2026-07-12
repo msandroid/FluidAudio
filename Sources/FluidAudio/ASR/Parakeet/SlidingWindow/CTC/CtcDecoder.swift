@@ -69,6 +69,76 @@ public func ctcGreedyDecode(
     return decodeCtcTokenIds(ids, vocabulary: vocabulary)
 }
 
+/// Greedy CTC decode from raw logits exported by `CtcDecoder.mlmodelc` (ja CoreML).
+///
+/// The HuggingFace model card requires `log_softmax` before CTC decoding. For greedy
+/// decoding, `argmax` is identical on raw logits and log-probabilities; this helper
+/// uses stride-correct pointer indexing (supports `[1, T, V]` and `[1, V, T]`).
+///
+/// - Parameters:
+///   - rawLogits: MLMultiArray shape `[1, T, V]` or `[1, V, T]` with raw logits.
+///   - vocabulary: Token vocabulary mapping token ID → string.
+///   - blankId: CTC blank token index (3072 for ja).
+public func ctcGreedyDecodeFromRawLogits(
+    _ rawLogits: MLMultiArray,
+    vocabulary: [Int: String],
+    blankId: Int
+) -> String {
+    guard rawLogits.shape.count >= 3 else { return "" }
+    let d1 = rawLogits.shape[1].intValue
+    let d2 = rawLogits.shape[2].intValue
+    let vocabSize = blankId + 1
+
+    let strides = rawLogits.strides.map { $0.intValue }
+    guard strides.count >= 3 else { return "" }
+    let s1 = strides[1]
+    let s2 = strides[2]
+    let ptr = rawLogits.dataPointer.assumingMemoryBound(to: Float.self)
+
+    var ids: [Int] = []
+    ids.reserveCapacity(min(d1, d2))
+    var prev = -1
+
+    if d2 == vocabSize {
+        // [1, T, V]
+        let timeSteps = d1
+        for t in 0..<timeSteps {
+            let base = t * s1
+            var bestVal: Float = -.infinity
+            var bestIdx = 0
+            for v in 0..<vocabSize {
+                let x = ptr[base + v * s2]
+                if x > bestVal {
+                    bestVal = x
+                    bestIdx = v
+                }
+            }
+            if bestIdx != blankId && bestIdx != prev { ids.append(bestIdx) }
+            prev = bestIdx
+        }
+    } else if d1 == vocabSize {
+        // [1, V, T]
+        let timeSteps = d2
+        for t in 0..<timeSteps {
+            var bestVal: Float = -.infinity
+            var bestIdx = 0
+            for v in 0..<vocabSize {
+                let x = ptr[v * s1 + t * s2]
+                if x > bestVal {
+                    bestVal = x
+                    bestIdx = v
+                }
+            }
+            if bestIdx != blankId && bestIdx != prev { ids.append(bestIdx) }
+            prev = bestIdx
+        }
+    } else {
+        return ""
+    }
+
+    return decodeCtcTokenIds(ids, vocabulary: vocabulary)
+}
+
 // MARK: - CTC Beam Search
 
 /// A single hypothesis in the CTC beam search.
