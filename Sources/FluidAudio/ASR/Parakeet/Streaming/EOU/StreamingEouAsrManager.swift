@@ -158,6 +158,12 @@ public typealias EouCallback = @Sendable (String) -> Void
 /// - Parameter transcript: The current accumulated partial transcript
 public typealias PartialCallback = @Sendable (String) -> Void
 
+/// Callback invoked once per utterance when accumulated tokens approach the forced-EOU cap.
+/// - Parameters:
+///   - tokenCount: Current accumulated token count
+///   - maxTokens: Configured ``maxTokensBeforeForcedEou`` cap
+public typealias ApproachingForcedEouCallback = @Sendable (Int, Int) -> Void
+
 /// High-level manager for the Parakeet EOU streaming pipeline.
 /// Uses native Swift mel spectrogram for exact NeMo parity.
 public actor StreamingEouAsrManager {
@@ -217,6 +223,18 @@ public actor StreamingEouAsrManager {
     /// Safety cap: force EOU when token buffer exceeds this count (prevents unbounded accumulation).
     public var maxTokensBeforeForcedEou: Int
 
+    /// Fraction of ``maxTokensBeforeForcedEou`` at which ``ApproachingForcedEouCallback`` fires once per utterance.
+    public var approachingForcedEouFraction: Double = 0.80
+
+    /// Current accumulated RNNT token count for the active utterance.
+    public var accumulatedTokenCount: Int {
+        accumulatedTokenIds.count
+    }
+
+    /// Optional callback invoked once when ``accumulatedTokenCount`` reaches the approaching-forced-EOU threshold.
+    private var approachingForcedEouCallback: ApproachingForcedEouCallback?
+    private var approachingForcedEouFired = false
+
     public private(set) var configuration: MLModelConfiguration
     public let debugFeatures: Bool
     private var debugFeatureBuffer: [Float] = []
@@ -260,6 +278,60 @@ public actor StreamingEouAsrManager {
     /// Useful for displaying "ghost text" during speech.
     public func setPartialCallback(_ callback: @escaping PartialCallback) {
         self.partialCallback = callback
+    }
+
+    /// Set a callback invoked once per utterance when token count nears the forced-EOU cap.
+    public func setApproachingForcedEouCallback(_ callback: @escaping ApproachingForcedEouCallback) {
+        self.approachingForcedEouCallback = callback
+    }
+
+    /// Minimum token count at or above ``approachingForcedEouFraction`` of ``maxTokensBeforeForcedEou``.
+    public func approachingForcedEouTokenThreshold() -> Int {
+        Int(Double(maxTokensBeforeForcedEou) * approachingForcedEouFraction)
+    }
+
+    /// Returns the prefix token count at the last sentence boundary, or `nil` when no soft-roll split is viable.
+    public static func sentenceBoundaryTokenSplitIndex(
+        ids: [Int],
+        tokenizer: Tokenizer,
+        minRemainderTokens: Int = 3
+    ) -> Int? {
+        guard ids.count > minRemainderTokens else { return nil }
+        let full = tokenizer.decode(ids: ids)
+        guard !full.isEmpty else { return nil }
+
+        var splitEndIndex: String.Index?
+        for punct in [".", "!", "?"] {
+            if let idx = full.lastIndex(of: Character(punct)) {
+                splitEndIndex = full.index(after: idx)
+                break
+            }
+        }
+        if splitEndIndex == nil {
+            for punct in [",", ";"] {
+                if let idx = full.lastIndex(of: Character(punct)) {
+                    let prefixCount = full.distance(from: full.startIndex, to: full.index(after: idx))
+                    if prefixCount >= 40 {
+                        splitEndIndex = full.index(after: idx)
+                        break
+                    }
+                }
+            }
+        }
+        guard let endIdx = splitEndIndex, endIdx > full.startIndex else { return nil }
+        let targetPrefixLen = full.distance(from: full.startIndex, to: endIdx)
+
+        var tokenSplit = 0
+        for index in 1...ids.count {
+            let prefix = tokenizer.decode(ids: Array(ids.prefix(index)))
+            if prefix.count >= targetPrefixLen {
+                tokenSplit = index
+                break
+            }
+        }
+        guard tokenSplit > 0, tokenSplit < ids.count else { return nil }
+        guard ids.count - tokenSplit >= minRemainderTokens else { return nil }
+        return tokenSplit
     }
 
     /// Returns timestamps (ms) aligned with the accumulated token IDs.
@@ -467,8 +539,16 @@ public actor StreamingEouAsrManager {
         eouDetected = false
         eouFirstDetectedAt = nil
         totalSamplesProcessed = 0
+        clearApproachingForcedEouLatch()
         try? resetStates()
         rnntDecoder?.resetState()
+    }
+
+    /// Clears EOU debounce flags after a soft-roll forced EOU while retaining encoder state and remaining tokens.
+    public func clearAfterSoftRollForcedEou() {
+        eouDetected = false
+        eouFirstDetectedAt = nil
+        clearApproachingForcedEouLatch()
     }
 
     public func cleanup() async {
@@ -597,6 +677,7 @@ public actor StreamingEouAsrManager {
         if let callback = partialCallback, let tokenizer = tokenizer, !decodeResult.tokenIds.isEmpty {
             let partial = tokenizer.decode(ids: accumulatedTokenIds)
             callback(partial)
+            maybeFireApproachingForcedEou()
         }
 
         // Track total samples for timing
@@ -620,41 +701,98 @@ public actor StreamingEouAsrManager {
                 let elapsedMs = (elapsedSamples * 1000) / 16000  // Convert samples to ms at 16kHz
 
                 if elapsedMs >= eouDebounceMs && !eouDetected {
-                    eouDetected = true
-                    logger.info("EOU confirmed at chunk \(processedChunks) after \(elapsedMs)ms silence")
-                    let eouTimestampMs = (totalSamplesProcessed * 1000) / 16000
-                    accumulatedEouTimestampsMs.append(eouTimestampMs)
-
-                    // Invoke callback with current transcript
-                    if let callback = eouCallback, let tokenizer = tokenizer {
-                        let transcript = tokenizer.decode(ids: accumulatedTokenIds)
-                        callback(transcript)
-                    }
+                    deliverNaturalEou(at: (totalSamplesProcessed * 1000) / 16000)
                 }
             }
         } else {
             // Model did not predict EOU - speech is ongoing, reset debounce timer
             eouFirstDetectedAt = nil
-            
+
             // Safety guard: Force an EOU if the utterance grows excessively long.
-            // This prevents infinite string accumulation, UI lag, and translation pipeline stalls 
+            // This prevents infinite string accumulation, UI lag, and translation pipeline stalls
             // if the user speaks continuously for a very long time without a 3-second pause.
-            let maxTokensBeforeForcedEou = self.maxTokensBeforeForcedEou
             if accumulatedTokenIds.count > maxTokensBeforeForcedEou && !eouDetected {
-                eouDetected = true
-                logger.warning("Forced EOU at chunk \\(processedChunks) due to max token count (\\(maxTokensBeforeForcedEou)) exceeded")
-                let eouTimestampMs = (totalSamplesProcessed * 1000) / 16000
-                accumulatedEouTimestampsMs.append(eouTimestampMs)
-                
-                // Invoke callback with current transcript
-                if let callback = eouCallback, let tokenizer = tokenizer {
-                    let transcript = tokenizer.decode(ids: accumulatedTokenIds)
-                    callback(transcript)
-                }
+                deliverForcedEou(at: (totalSamplesProcessed * 1000) / 16000)
             }
         }
 
         processedChunks += 1
+    }
+
+    private func maybeFireApproachingForcedEou() {
+        guard !approachingForcedEouFired, !eouDetected else { return }
+        let threshold = approachingForcedEouTokenThreshold()
+        guard accumulatedTokenIds.count >= threshold else { return }
+        approachingForcedEouFired = true
+        approachingForcedEouCallback?(accumulatedTokenIds.count, maxTokensBeforeForcedEou)
+    }
+
+    private func clearApproachingForcedEouLatch() {
+        approachingForcedEouFired = false
+    }
+
+    private func deliverNaturalEou(at eouTimestampMs: Int) {
+        guard !eouDetected else { return }
+        eouDetected = true
+        logger.info("EOU confirmed at chunk \(processedChunks) after debounce")
+        accumulatedEouTimestampsMs.append(eouTimestampMs)
+        clearApproachingForcedEouLatch()
+        if let callback = eouCallback, let tokenizer = tokenizer {
+            let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+            clearCommittedTokenState()
+            callback(transcript)
+        }
+    }
+
+    private func deliverForcedEou(at eouTimestampMs: Int) {
+        guard let callback = eouCallback, let tokenizer = tokenizer else { return }
+        if let splitIndex = Self.sentenceBoundaryTokenSplitIndex(
+            ids: accumulatedTokenIds,
+            tokenizer: tokenizer
+        ) {
+            let committedIds = Array(accumulatedTokenIds.prefix(splitIndex))
+            let committedTranscript = tokenizer.decode(ids: committedIds).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !committedTranscript.isEmpty else {
+                deliverFullForcedEou(at: eouTimestampMs)
+                return
+            }
+            accumulatedTokenIds.removeFirst(splitIndex)
+            if accumulatedTokenTimestampsMs.count >= splitIndex {
+                accumulatedTokenTimestampsMs.removeFirst(splitIndex)
+            }
+            if accumulatedRawTokenStrings.count >= splitIndex {
+                accumulatedRawTokenStrings.removeFirst(splitIndex)
+            }
+            accumulatedEouTimestampsMs.append(eouTimestampMs)
+            eouDetected = false
+            eouFirstDetectedAt = nil
+            clearApproachingForcedEouLatch()
+            logger.warning(
+                "Forced EOU soft-roll at chunk \(processedChunks): committed \(splitIndex) tokens, retained \(accumulatedTokenIds.count)"
+            )
+            callback(committedTranscript)
+            return
+        }
+        deliverFullForcedEou(at: eouTimestampMs)
+    }
+
+    private func deliverFullForcedEou(at eouTimestampMs: Int) {
+        guard let callback = eouCallback, let tokenizer = tokenizer else { return }
+        eouDetected = true
+        logger.warning(
+            "Forced EOU at chunk \(processedChunks) due to max token count (\(maxTokensBeforeForcedEou)) exceeded"
+        )
+        accumulatedEouTimestampsMs.append(eouTimestampMs)
+        clearApproachingForcedEouLatch()
+        let transcript = tokenizer.decode(ids: accumulatedTokenIds)
+        clearCommittedTokenState()
+        callback(transcript)
+    }
+
+    private func clearCommittedTokenState() {
+        accumulatedTokenIds.removeAll()
+        accumulatedTokenTimestampsMs.removeAll()
+        accumulatedRawTokenStrings.removeAll()
     }
 
     public func saveDebugFeatures(to url: URL) throws {
