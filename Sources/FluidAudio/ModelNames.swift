@@ -62,6 +62,13 @@ public enum Repo: String, CaseIterable, Sendable {
     /// recipe. Ships four `.mlmodelc` bundles + `tts.json` +
     /// `unicode_indexer.json` at the repo root.
     case supertonic3 = "FluidInference/supertonic-3-coreml"
+    /// Canary-1B-v2 (NVIDIA) — attention encoder-decoder (AED) ASR, 25 European
+    /// languages, 16384-token SentencePiece BPE. 4-stage CoreML pipeline:
+    /// fp32/CPU preprocessor (waveform→mel) + FastConformer encoder + autoregressive
+    /// Transformer decoder (full-sequence re-run per step) + 1024→16384 projection,
+    /// greedy until EOS (id 3). int4 encoder/decoder run on ANE (iOS18); fp16 is the
+    /// iOS17 parity fallback. See ASR/Canary.
+    case canary1bV2 = "FluidInference/canary-1b-v2-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -134,6 +141,8 @@ public enum Repo: String, CaseIterable, Sendable {
             return "StyleTTS-2-coreml/iteration_3/compiled"
         case .supertonic3:
             return "supertonic-3-coreml"
+        case .canary1bV2:
+            return "canary-1b-v2-coreml"
         }
     }
 
@@ -1192,6 +1201,37 @@ public enum ModelNames {
         }
     }
 
+    /// Canary-1B-v2 (AED) model names. 4 CoreML stages + host greedy loop:
+    ///   Preprocessor (fp32/CPU): waveform [1,240000] -> mel [1,128,1501]
+    ///   Encoder (int4 ANE / fp16): mel -> encoder [1,1024,188]
+    ///   Decoder (int4 ANE / fp16): autoregressive transformer hidden states
+    ///   Projection (fp16/ANE): hidden [1,1024] -> logits [1,16384]
+    /// Plus `vocab.json` (16384 SentencePiece pieces, id -> piece). int4 needs iOS18.
+    public enum Canary {
+        public static let preprocessor = "Preprocessor"
+        public static let projection = "Projection"
+        public static let encoder = "Encoder"  // fp16, ANE, iOS17
+        public static let encoderInt4 = "EncoderInt4"  // int4, ANE, iOS18 (default)
+        public static let encoderInt8 = "EncoderInt8"  // int8, CPU-only
+        public static let decoder = "Decoder"  // fp16
+        public static let decoderInt4 = "DecoderInt4"  // int4 (default)
+        public static let decoderInt8 = "DecoderInt8"  // int8, CPU-only
+
+        public static let preprocessorFile = preprocessor + ".mlmodelc"
+        public static let projectionFile = projection + ".mlmodelc"
+        public static let vocabularyFile = "vocab.json"
+
+        public static func requiredModels(precision: CanaryPrecision = .int4) -> Set<String> {
+            [
+                preprocessorFile,
+                projectionFile,
+                precision.encoderName + ".mlmodelc",
+                precision.decoderName + ".mlmodelc",
+                vocabularyFile,
+            ]
+        }
+    }
+
     static func getRequiredModelNames(for repo: Repo, variant: String?) -> Set<String> {
         switch repo {
         case .nemotronMultilingual:
@@ -1283,6 +1323,9 @@ public enum ModelNames {
             }
         case .supertonic3:
             return ModelNames.Supertonic3.requiredFiles(veVariant: variant)
+        case .canary1bV2:
+            return ModelNames.Canary.requiredModels(
+                precision: CanaryPrecision(rawValue: variant ?? "") ?? .int4)
         }
     }
 }
