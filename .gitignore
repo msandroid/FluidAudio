@@ -120,6 +120,9 @@ fluidaudio_cli/*
 # Continuous Claude cache (local only)
 .claude/cache/
 
+# Xcode build output (the app target builds the package in place)
+build/
+
 # Supertonic-3 local model-conversion artifacts (research-only;
 # scripts + trials live in mobius repo, see models/tts/supertonic_3/).
 .venv-supertonic3/
