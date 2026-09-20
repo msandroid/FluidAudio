@@ -41,4 +41,19 @@ public enum SenseVoiceConfig {
         for b in buckets where b >= frames { return b }
         return buckets.last ?? 1800
     }
+
+    /// Convert BCP-47 / language tag to SenseVoice language ID (0: auto, 1: zh, 2: en, 3: yue, 4: ja, 5: ko)
+    public static func languageId(for code: String?) -> Int32 {
+        guard let code = code?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !code.isEmpty else { return 0 }
+        let clean = code.split(separator: "-").first.map(String.init) ?? code
+        let base = clean.split(separator: "_").first.map(String.init) ?? clean
+        switch base {
+        case "zh": return 1
+        case "en": return 2
+        case "yue": return 3
+        case "ja": return 4
+        case "ko": return 5
+        default: return 0 // auto
+        }
+    }
 }

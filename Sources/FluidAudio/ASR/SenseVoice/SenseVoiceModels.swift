@@ -17,7 +17,23 @@ public enum SenseVoiceEncoderPrecision: String, Sendable {
     }
 
     var computeUnits: MLComputeUnits {
-        self == .fp32 ? .all : .cpuAndNeuralEngine
+        #if os(iOS)
+        // `.cpuOnly` left the encoder on the slowest path available and did it
+        // for every precision, so fp16 weights ran with neither ANE nor GPU --
+        // close to the worst pairing there is. Coverage on this engine is
+        // throughput-bound (it keeps up with speech or it drops it), so that
+        // ceiling is measurable, not theoretical.
+        //
+        // `.cpuAndGPU` rather than `.all`: the GPU is the part that was being
+        // left on the table, and it is available both on device and in the
+        // Simulator, where Core ML maps it to the host GPU. ANE is deliberately
+        // not requested -- a live voice session already contends for it with
+        // WhisperKit compiles and Omnilingual, and this file is not the place to
+        // enter that fight.
+        return .cpuAndGPU
+        #else
+        return self == .fp32 ? .all : .cpuAndNeuralEngine
+        #endif
     }
 }
 
@@ -99,13 +115,22 @@ public struct SenseVoiceModels: Sendable {
         let cpuConfig = MLModelConfiguration()
         cpuConfig.computeUnits = .cpuOnly
 
-        // fp16/int8 encoders are correct on the Neural Engine; fp32 runs anywhere.
         let encoderConfig = MLModelConfiguration()
         encoderConfig.computeUnits = precision.computeUnits
+        encoderConfig.allowLowPrecisionAccumulationOnGPU = true
 
         let preprocessor = try loadModel(
             named: ModelNames.SenseVoice.preprocessor, from: directory, configuration: cpuConfig)
-        let encoder = try loadModel(named: precision.modelName, from: directory, configuration: encoderConfig)
+        
+        let encoder: MLModel
+        do {
+            encoder = try loadModel(named: precision.modelName, from: directory, configuration: encoderConfig)
+        } catch {
+            logger.warning("Failed to load SenseVoice encoder with \(encoderConfig.computeUnits.rawValue), retrying with .cpuOnly: \(error)")
+            let fallbackConfig = MLModelConfiguration()
+            fallbackConfig.computeUnits = .cpuOnly
+            encoder = try loadModel(named: precision.modelName, from: directory, configuration: fallbackConfig)
+        }
         let vocabulary = try loadVocabulary(from: directory)
 
         logger.info("Loaded SenseVoice (encoder: \(precision.rawValue), vocab: \(vocabulary.count))")

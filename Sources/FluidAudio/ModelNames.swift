@@ -811,6 +811,7 @@ public enum ModelNames {
             audioEncoderFile,
             decoderStatefulFile,
             embeddingsFile,
+            "vocab.json",
         ]
     }
 

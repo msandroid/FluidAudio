@@ -259,7 +259,12 @@ public class DownloadUtils {
         progressHandler: ProgressHandler? = nil
     ) async throws -> [String: MLModel] {
         await SystemInfo.logOnce(using: logger)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Use the robust creator: a stray file left behind by a previous crash or
+        // interrupted download anywhere along this path (e.g. "Application Support"
+        // itself, or a "FluidAudio"/"Models" component) otherwise makes plain
+        // createDirectory throw NSCocoaErrorDomain 512 / ENOTDIR forever, since the
+        // caller's cache-clear retry only removes `repoPath`, not ancestors of `directory`.
+        try createDirectoryRobustly(at: directory)
 
         let repoPath = directory.appendingPathComponent(repo.folderName)
         let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant)
@@ -291,7 +296,14 @@ public class DownloadUtils {
             try await downloadRepo(
                 repo, to: directory, variant: variant,
                 additionalModelNames: extraModelNames,
-                progressHandler: progressHandler)
+                progressHandler: { snap in
+                    progressHandler?(
+                        DownloadProgress(
+                            fractionCompleted: snap.fractionCompleted * 0.5,
+                            phase: snap.phase
+                        )
+                    )
+                })
         } else {
             logger.info("Found \(repo.folderName) locally, no download needed")
             progressHandler?(
@@ -377,7 +389,7 @@ public class DownloadUtils {
         logger.info("Downloading \(repo.folderName) from HuggingFace...")
 
         let repoPath = directory.appendingPathComponent(repo.folderName)
-        try FileManager.default.createDirectory(at: repoPath, withIntermediateDirectories: true)
+        try createDirectoryRobustly(at: repoPath)
 
         let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant)
             .union(additionalModelNames)
@@ -564,11 +576,10 @@ public class DownloadUtils {
                     onProgress: { bytesWritten, _ in
                         guard totalBytesSnapshot > 0 else { return }
                         let current = baseBytes + bytesWritten
-                        // Download phase occupies 0.0–0.5 of the overall range.
-                        let fraction = 0.5 * Double(current) / Double(totalBytesSnapshot)
+                        let fraction = Double(current) / Double(totalBytesSnapshot)
                         handler(
                             DownloadProgress(
-                                fractionCompleted: min(fraction, 0.5),
+                                fractionCompleted: min(fraction, 1.0),
                                 phase: .downloading(completedFiles: index, totalFiles: fileCount)
                             ))
                     }
@@ -584,19 +595,21 @@ public class DownloadUtils {
 
             // Validate response
             if httpResponse.statusCode == 429 || httpResponse.statusCode == 503 {
+                try? FileManager.default.removeItem(at: tempFileURL)
                 throw HuggingFaceDownloadError.rateLimited(
                     statusCode: httpResponse.statusCode,
                     message: "Rate limited while downloading \(file.path)")
             }
 
             guard (200..<300).contains(httpResponse.statusCode) else {
+                try? FileManager.default.removeItem(at: tempFileURL)
                 throw HuggingFaceDownloadError.downloadFailed(
                     path: file.path,
                     underlying: NSError(domain: "HTTP", code: httpResponse.statusCode)
                 )
             }
 
-            // Move downloaded file to destination
+            // Move downloaded file to destination atomically
             if FileManager.default.fileExists(atPath: destPath.path) {
                 try? FileManager.default.removeItem(at: destPath)
             }
@@ -611,10 +624,13 @@ public class DownloadUtils {
             progressHandler?(
                 DownloadProgress(
                     fractionCompleted: totalBytes > 0
-                        ? 0.5 * Double(completedBytes) / Double(totalBytes)
-                        : 0.5 * Double(index + 1) / Double(filesToDownload.count),
+                        ? min(1.0, Double(completedBytes) / Double(totalBytes))
+                        : min(1.0, Double(index + 1) / Double(filesToDownload.count)),
                     phase: .downloading(completedFiles: index + 1, totalFiles: filesToDownload.count)
                 ))
+            
+            // Allow thread to yield and ARC/autorelease cleanup to occur
+            await Task.yield()
         }
 
         // Verify required models are present
@@ -685,13 +701,18 @@ public class DownloadUtils {
         onProgress: @escaping @Sendable (Int64, Int64) -> Void
     ) async throws -> (URL, HTTPURLResponse) {
         let delegate = DownloadProgressDelegate(onProgress: onProgress)
-        // Dedicated session with delegate — one per download to avoid cross-talk.
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = request.timeoutInterval
         let session = URLSession(
-            configuration: sharedSession.configuration,
+            configuration: config,
             delegate: delegate,
             delegateQueue: nil
         )
-        defer { session.finishTasksAndInvalidate() }
+        defer {
+            session.invalidateAndCancel()
+        }
 
         let (tempURL, response) = try await session.download(for: request)
 
