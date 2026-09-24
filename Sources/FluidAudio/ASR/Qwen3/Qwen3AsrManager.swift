@@ -38,7 +38,8 @@ public actor Qwen3AsrManager {
     ///
     /// - Parameters:
     ///   - audioSamples: 16kHz mono Float32 audio samples.
-    ///   - language: Optional language hint (ISO code like "en", "zh", or English name like "English").
+    ///   - language: Optional language (ISO code like "en", "zh", or English name like "English").
+    ///               Forces the output language with the official `language X<asr_text>` prefix.
     ///               Pass nil for automatic language detection.
     ///   - maxNewTokens: Maximum number of tokens to generate.
     /// - Returns: Transcribed text.
@@ -97,7 +98,7 @@ public actor Qwen3AsrManager {
         let audioEncodeTime = CFAbsoluteTimeGetCurrent() - t1
 
         // Step 2: Build chat template with audio tokens
-        let promptTokens = buildPromptTokens(numAudioFrames: numAudioFrames, language: resolvedLanguage)
+        let promptTokens = Qwen3AsrPrompt.promptTokens(numAudioFrames: numAudioFrames, language: resolvedLanguage)
 
         // Step 3: Swift-side embedding + audio merge
         let t3 = CFAbsoluteTimeGetCurrent()
@@ -206,76 +207,6 @@ public actor Qwen3AsrManager {
         return try MLDictionaryFeatureProvider(dictionary: [
             "mel_input": MLFeatureValue(multiArray: array)
         ])
-    }
-
-    // MARK: - Token Building
-
-    /// Task description token IDs for language-specific transcription.
-    /// These are tokenized versions of "Transcribe the audio to {Language} text."
-    private static let taskTokens: [Qwen3AsrConfig.Language: [Int32]] = [
-        .english: [3246, 56541, 279, 7461, 311, 6364, 1467, 13],
-        .chinese: [3246, 56541, 279, 7461, 311, 8449, 1467, 13],
-        .cantonese: [3246, 56541, 279, 7461, 311, 56782, 26730, 1467, 13],
-        .japanese: [3246, 56541, 279, 7461, 311, 11411, 1467, 13],
-        .korean: [3246, 56541, 279, 7461, 311, 15791, 1467, 13],
-        .french: [3246, 56541, 279, 7461, 311, 8620, 1467, 13],
-        .german: [3246, 56541, 279, 7461, 311, 6581, 1467, 13],
-        .spanish: [3246, 56541, 279, 7461, 311, 14610, 1467, 13],
-        .portuguese: [3246, 56541, 279, 7461, 311, 42322, 1467, 13],
-        .italian: [3246, 56541, 279, 7461, 311, 15333, 1467, 13],
-        .russian: [3246, 56541, 279, 7461, 311, 10479, 1467, 13],
-        .arabic: [3246, 56541, 279, 7461, 311, 17900, 1467, 13],
-        .hindi: [3246, 56541, 279, 7461, 311, 43083, 1467, 13],
-        .thai: [3246, 56541, 279, 7461, 311, 40764, 1467, 13],
-        .vietnamese: [3246, 56541, 279, 7461, 311, 48416, 1467, 13],
-        .indonesian: [3246, 56541, 279, 7461, 311, 66986, 1467, 13],
-        .malay: [3246, 56541, 279, 7461, 311, 80985, 1467, 13],
-        .turkish: [3246, 56541, 279, 7461, 311, 38703, 1467, 13],
-        .dutch: [3246, 56541, 279, 7461, 311, 19227, 1467, 13],
-        .swedish: [3246, 56541, 279, 7461, 311, 54259, 1467, 13],
-        .danish: [3246, 56541, 279, 7461, 311, 39093, 1467, 13],
-        .finnish: [3246, 56541, 279, 7461, 311, 56391, 1467, 13],
-        .polish: [3246, 56541, 279, 7461, 311, 34827, 1467, 13],
-        .czech: [3246, 56541, 279, 7461, 311, 51728, 1467, 13],
-        .greek: [3246, 56541, 279, 7461, 311, 18173, 1467, 13],
-        .hungarian: [3246, 56541, 279, 7461, 311, 57751, 1467, 13],
-        .romanian: [3246, 56541, 279, 7461, 311, 56949, 1467, 13],
-        .persian: [3246, 56541, 279, 7461, 311, 59181, 1467, 13],
-        .filipino: [3246, 56541, 279, 7461, 311, 66847, 1467, 13],
-        .macedonian: [3246, 56541, 279, 7461, 311, 17067, 103881, 1467, 13],
-    ]
-
-    private func buildPromptTokens(numAudioFrames: Int, language: Qwen3AsrConfig.Language?) -> [Int32] {
-        var tokens: [Int32] = []
-
-        // System message with optional task description
-        tokens.append(Int32(Qwen3AsrConfig.imStartTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.systemTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.newlineTokenId))
-        if let lang = language, let taskToks = Self.taskTokens[lang] {
-            tokens.append(contentsOf: taskToks)
-        }
-        tokens.append(Int32(Qwen3AsrConfig.imEndTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.newlineTokenId))
-
-        // User message with audio
-        tokens.append(Int32(Qwen3AsrConfig.imStartTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.userTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.newlineTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.audioStartTokenId))
-        for _ in 0..<numAudioFrames {
-            tokens.append(Int32(Qwen3AsrConfig.audioTokenId))
-        }
-        tokens.append(Int32(Qwen3AsrConfig.audioEndTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.imEndTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.newlineTokenId))
-
-        // Assistant start
-        tokens.append(Int32(Qwen3AsrConfig.imStartTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.assistantTokenId))
-        tokens.append(Int32(Qwen3AsrConfig.newlineTokenId))
-
-        return tokens
     }
 
     // MARK: - Swift-side Embedding & Audio Merge
