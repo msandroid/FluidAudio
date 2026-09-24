@@ -43,7 +43,8 @@ Qwen3-ASR supports 30 languages with automatic language detection:
 // Auto-detect language (default)
 let text = try await manager.transcribe(audioSamples: samples)
 
-// Specify language for better accuracy
+// Force the output language (official Qwen3-ASR `language X<asr_text>` prefix after the
+// assistant header; the system turn stays empty)
 let text = try await manager.transcribe(audioSamples: samples, language: .chinese)
 let text = try await manager.transcribe(audioSamples: samples, language: .japanese)
 ```
